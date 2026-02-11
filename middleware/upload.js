@@ -24,16 +24,23 @@ const storage = new CloudinaryStorage({
       };
     }
 
-    // PDF / DOC FILE
+    // PDF
+    if (file.mimetype === "application/pdf") {
+      return {
+        folder: "campaign_media/pdfs",
+        resource_type: "raw",
+        format: "pdf"
+      };
+    }
+
+    // fallback (any other file)
     return {
       folder: "campaign_media/files",
-      resource_type: "raw",
+      resource_type: "raw"
     };
   }
 });
 
-const upload = multer({
-  storage
-});
+const upload = multer({ storage });
 
 module.exports = upload;

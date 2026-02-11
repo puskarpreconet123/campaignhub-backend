@@ -28,7 +28,6 @@ const storage = new CloudinaryStorage({
     return {
       folder: "campaign_media/files",
       resource_type: "raw",
-      allowed_formats: ["pdf"]
     };
   }
 });

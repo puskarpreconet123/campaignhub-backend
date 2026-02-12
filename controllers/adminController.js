@@ -85,5 +85,20 @@ exports.getAllUserCampaigns = async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 };
-
+  exports.updateStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    
+    const updatedCampaign = await Campaign.findByIdAndUpdate(
+      id, 
+      { status }, 
+      { new: true }
+    );
+    
+    res.json(updatedCampaign);
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+}
 

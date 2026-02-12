@@ -25,7 +25,7 @@ const campaignSchema = new mongoose.Schema({
   phoneNumbers: [String],
   status: { 
     type: String, 
-    enum: ["pending", "sent", "failed"],
+    enum: ["pending", 'processing', 'completed', 'rejected'],
     default: "pending"
   },
   media: [mediaSchema]  // ✅ PROPER REFERENCE

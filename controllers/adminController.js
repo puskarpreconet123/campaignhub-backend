@@ -85,20 +85,45 @@ exports.getAllUserCampaigns = async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 };
-  exports.updateStatus = async (req, res) => {
+
+exports.updateStatus = async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
-    
-    const updatedCampaign = await Campaign.findByIdAndUpdate(
-      id, 
-      { status }, 
-      { new: true }
-    );
-    
-    res.json(updatedCampaign);
+
+    // 1. Find the campaign first to check its current data
+    const campaign = await Campaign.findById(id);
+    if (!campaign) {
+      return res.status(404).json({ message: "Campaign not found" });
+    }
+
+    // 2. Logic for Refund: If status is being changed to 'rejected'
+    // and it wasn't already rejected (to prevent double refunds)
+    if (status === "rejected" && campaign.status !== "rejected") {
+      const refundAmount = campaign.phoneNumbers.length;
+
+      await User.findByIdAndUpdate(campaign.userId, {
+        $inc: { credits: refundAmount } // Use $inc to safely increment the value
+      });
+      
+      console.log(`Refunded ${refundAmount} credits to user ${campaign.userId}`);
+    }
+    else if(status !== "rejected" && campaign.status === "rejected"){
+      const reductAmount = campaign.phoneNumbers.length;
+      await User.findByIdAndUpdate(campaign.userId, {
+        $inc: {credits: -reductAmount}
+      }, {new: true})
+      console.log(`Reducted ${reductAmount} credits from user ${campaign.userId}`);
+    }
+
+    // 3. Update the campaign status
+    campaign.status = status;
+    await campaign.save();
+
+    res.json(campaign);
   } catch (err) {
+    console.error("Update Status Error:", err);
     res.status(500).json({ message: "Server error" });
   }
-}
+};
 

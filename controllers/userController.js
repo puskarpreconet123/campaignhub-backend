@@ -1,5 +1,6 @@
 const Campaign = require("../models/Campaign");
 const User = require("../models/User")
+const Transaction = require("../models/Transaction")
 
 exports.getDashboard = async (req, res) => {
   res.json({ msg: "User dashboard data" });
@@ -50,3 +51,11 @@ exports.getUserDetails = async (req, res) => {
     res.status(500).json({ message: "Server error while fetching profile" });
   }
 }
+
+exports.getUserCreditHistory = async (req, res) => {
+  const history = await Transaction.find({ userId: req.user.id })
+    .sort({ createdAt: -1 }) // Newest transactions first
+    .limit(50); // Keep it fast by limiting the result
+  const userName = await User.findById(req.user.id ).select("email credits")
+  return res.json({history, userName});
+};

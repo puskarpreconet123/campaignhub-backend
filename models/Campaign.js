@@ -28,7 +28,16 @@ const campaignSchema = new mongoose.Schema({
     enum: ["pending", 'processing', 'completed', 'rejected'],
     default: "pending"
   },
-  media: [mediaSchema]  // ✅ PROPER REFERENCE
+  media: [mediaSchema] , // ✅ PROPER REFERENCE
+  report: {
+  type: {
+    fileUrl: String,
+    fileKey: String,
+    uploadedAt: Date,
+    uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" }
+  },
+  default: null
+},
 }, { timestamps: true });
 
 module.exports = mongoose.model("Campaign", campaignSchema);

@@ -3,49 +3,106 @@ const User = require("../models/User");
 const Campaign = require("../models/Campaign");
 const Transaction = require("../models/Transaction")
 const mongoose = require("mongoose")
+const { PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const s3 = require("../config/wasabi");
+const { v4: uuidv4 } = require("uuid");
+const _ = require('lodash');
 
 exports.createUser = async (req, res) => {
-  const { name, email, password } = req.body;
-  const bcrypt = require("bcryptjs");
+  try {
+    const { name, email, password } = req.body;
 
-  const hashed = await bcrypt.hash(password, 10);
+    // 1️⃣ Basic validation
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: "All fields are required" });
+    }
 
-  const user = await User.create({
-    name,
-    email,
-    password: hashed,
-    role: "user"
-  });
+    if (password.length < 5) {
+      return res.status(400).json({ message: "Password must be at least 6 characters" });
+    }
 
-  res.json(user);
+    // 2️⃣ Check if user already exists
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ message: "Email already registered" });
+    }
+
+    // 3️⃣ Hash password
+    const bcrypt = require("bcryptjs");
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // 4️⃣ Create user
+    const user = await User.create({
+      name,
+      email,
+      password: hashedPassword,
+      role: "user",
+    });
+
+    // 5️⃣ Return safe response (never send password)
+    res.status(201).json({
+      message: "User created successfully",
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+      },
+    });
+
+  } catch (error) {
+    console.error("Create User Error:", error);
+    res.status(500).json({ message: "Server error while creating user" });
+  }
 };
 
 exports.addCredits = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
-  try {
-    const { userId, credits } = req.body;
-    const adminId = req.user.id;
-    const amount = Math.abs(credits); // The actual number to move
 
+  try {
+    // 1️⃣ Auth safety (extra layer)
     if (!req.user || req.user.role !== "admin") {
-      throw new Error("AUTH_DENIED: Admin only action");
+      return res.status(403).json({ message: "Admin only action" });
+    }
+    const userEmail = req.body.userId
+    const { credits } = req.body; // renamed for clarity
+    const adminId = req.user.id;
+    console.log(req.body)
+    // 2️⃣ Input validation
+    if (!userEmail || typeof credits !== "number") {
+      throw new Error("INVALID_INPUT: Valid email and credit amount required");
     }
 
-    // Determine the direction of the transaction
+    if (credits === 0) {
+      throw new Error("INVALID_INPUT: Credit amount cannot be zero");
+    }
+
+    const amount = Math.abs(credits);
     const isReduction = credits < 0;
 
+    // Prevent admin transferring to themselves
+    const admin = await User.findById(adminId).session(session);
+    if (!admin) throw new Error("AUTH_ERROR: Admin not found");
+
+    if (admin.email === userEmail) {
+      throw new Error("INVALID_ACTION: Cannot transfer credits to yourself");
+    }
+
     if (isReduction) {
-      /** * CONDITION: REMOVING CREDITS FROM USER
-       * Admin gets credits BACK (+), User LOSES credits (-)
+      /**
+       * CASE 1: REMOVE credits from user → Admin gets them
        */
+
       const updatedUser = await User.findOneAndUpdate(
-        { email: userId, credits: { $gte: amount } }, // Ensure user has enough to be deducted
+        { email: userEmail, credits: { $gte: amount } },
         { $inc: { credits: -amount } },
         { session, new: true }
       ).select("-password");
 
-      if (!updatedUser) throw new Error("USER_ERROR: User has insufficient credits or not found");
+      if (!updatedUser) {
+        throw new Error("USER_ERROR: User not found or insufficient credits");
+      }
 
       const updatedAdmin = await User.findByIdAndUpdate(
         adminId,
@@ -54,126 +111,276 @@ exports.addCredits = async (req, res) => {
       );
 
       await Transaction.create([
-        { userId: adminId, targetUserId: updatedUser._id, type: 'credit', amount, description: `reduct from user` },
-        { userId: updatedUser._id, targetUserId: adminId,  type: 'debit', amount, description: `reducted by admin` }
+        {
+          userId: adminId,
+          targetUserId: updatedUser._id,
+          type: "credit",
+          amount,
+          description: "Credits recovered from user"
+        },
+        {
+          userId: updatedUser._id,
+          targetUserId: adminId,
+          type: "debit",
+          amount,
+          description: "Credits deducted by admin"
+        }
       ], { session, ordered: true });
 
       await session.commitTransaction();
-      return res.json({ message: "Credits reduced successfully", newAdminBalance: updatedAdmin.credits, targetUser: updatedUser });
+
+      return res.json({
+        message: "Credits reduced successfully",
+        newAdminBalance: updatedAdmin.credits,
+        targetUser: updatedUser
+      });
 
     } else {
-      /** * CONDITION: ADDING CREDITS TO USER (Original Logic)
-       * Admin LOSES credits (-), User GAINS credits (+)
+      /**
+       * CASE 2: ADD credits to user → Admin loses them
        */
+
       const updatedAdmin = await User.findOneAndUpdate(
         { _id: adminId, credits: { $gte: amount } },
         { $inc: { credits: -amount } },
         { session, new: true }
       );
 
-      if (!updatedAdmin) throw new Error("CREDIT_ERROR: Admin has insufficient credits");
+      if (!updatedAdmin) {
+        throw new Error("CREDIT_ERROR: Admin has insufficient credits");
+      }
 
       const targetUser = await User.findOneAndUpdate(
-        { email: userId },
+        { email: userEmail },
         { $inc: { credits: amount } },
         { session, new: true }
       ).select("-password");
 
-      if (!targetUser) throw new Error("USER_ERROR: Target user not found");
+      if (!targetUser) {
+        throw new Error("USER_ERROR: Target user not found");
+      }
 
       await Transaction.create([
-        { userId: adminId, targetUserId: targetUser._id, type: 'debit', amount, description: `Assigned to ${userId}` },
-        { userId: targetUser._id, targetUserId: adminId, type: 'credit', amount, description: `Assigned by admin` }
+        {
+          userId: adminId,
+          targetUserId: targetUser._id,
+          type: "debit",
+          amount,
+          description: `Assigned to ${userEmail}`
+        },
+        {
+          userId: targetUser._id,
+          targetUserId: adminId,
+          type: "credit",
+          amount,
+          description: "Assigned by admin"
+        }
       ], { session, ordered: true });
 
       await session.commitTransaction();
-      return res.json({ message: "Credits assigned successfully", newAdminBalance: updatedAdmin.credits, targetUser });
+
+      return res.json({
+        message: "Credits assigned successfully",
+        newAdminBalance: updatedAdmin.credits,
+        targetUser
+      });
     }
 
   } catch (err) {
     if (session.inTransaction()) await session.abortTransaction();
-    console.error("Credit Error:", err);
-    let statusCode = err.message.includes("AUTH_DENIED") ? 403 : err.message.includes("USER_ERROR") ? 404 : 400;
-    res.status(statusCode).json({ message: err.message.split(": ")[1] || "Something went wrong" });
+
+    console.error("Credit Error:", err.message);
+
+    let statusCode = 400;
+    if (err.message.includes("AUTH")) statusCode = 403;
+    if (err.message.includes("USER_ERROR")) statusCode = 404;
+
+    res.status(statusCode).json({
+      message: err.message.split(": ")[1] || "Credit operation failed"
+    });
+
   } finally {
     session.endSession();
   }
 };
 
-
 exports.updateStatus = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
-  
+
   try {
     const { id } = req.params;
     const { status } = req.body;
 
-    // Use session even for the initial find to ensure consistency
+    // 1️⃣ Validate input
+    if (!status) {
+      throw new Error("Status is required");
+    }
+
+    // 🔥 Removed "completed" from allowed transitions
+    const allowedTransitions = {
+      pending: ["processing", "rejected"],
+      processing: ["rejected"], // completion handled in /report
+      completed: [],
+      rejected: []
+    };
+
+    // 2️⃣ Fetch campaign inside session
     const campaign = await Campaign.findById(id).session(session);
     if (!campaign) {
       throw new Error("Campaign not found");
     }
 
-    const creditAmount = campaign.phoneNumbers.length;
-
-    // CASE A: Refunding (Pending/Processing -> Rejected)
-    if (status === "rejected" && campaign.status !== "rejected") {
-      await User.findByIdAndUpdate(
-        campaign.userId, 
-        { $inc: { credits: creditAmount } },
-        { session } // CRITICAL: Link to session
-      );
-
-      await Transaction.create([{
-        userId: campaign.userId,
-        targetUserId: campaign.userId,
-        type: 'credit', // In your system 'credit' = refund/plus
-        amount: creditAmount,
-        description: `Refund: Campaign Rejected by Admin`,
-      }], { session });
-
-      console.log(`Refunded ${creditAmount} credits`);
-    } 
-    
-    // CASE B: Re-deducting (Rejected -> Pending/Processing/Completed)
-    else if (status !== "rejected" && campaign.status === "rejected") {
-      // Safety Check: Does the user have enough credits to "un-reject" this?
-      const user = await User.findById(campaign.userId).session(session);
-      if (user.credits < creditAmount) {
-        throw new Error("User has insufficient credits to reactivate this campaign.");
-      }
-
-      await User.findByIdAndUpdate(
-        campaign.userId, 
-        { $inc: { credits: -creditAmount } },
-        { session }
-      );
-
-      await Transaction.create([{
-        userId: campaign.userId,
-        targetUserId: campaign.userId,
-        type: 'debit', // In your system 'debit' = deduction/minus
-        amount: creditAmount,
-        description: `Deduction: Campaign Reactivated by Admin`,
-      }], { session });
-
-      console.log(`Deducted ${creditAmount} credits`);
+    // 3️⃣ Prevent updates to locked states
+    if (["completed", "rejected"].includes(campaign.status)) {
+      throw new Error(`Campaign already ${campaign.status} and cannot be updated`);
     }
 
-    // 3. Update campaign
+    // 4️⃣ Validate transition safely
+    const possibleTransitions = allowedTransitions[campaign.status] || [];
+    if (!possibleTransitions.includes(status)) {
+      throw new Error(`Invalid transition from ${campaign.status} to ${status}`);
+    }
+
+    const creditAmount = campaign.phoneNumbers?.length || 0;
+
+    // 5️⃣ Refund logic (only when moving TO rejected)
+    if (status === "rejected") {
+      const updatedUser = await User.findByIdAndUpdate(
+        campaign.userId,
+        { $inc: { credits: creditAmount } },
+        { session, new: true }
+      );
+
+      if (!updatedUser) {
+        throw new Error("User not found for refund");
+      }
+
+      await Transaction.create(
+        [{
+          userId: campaign.userId,
+          targetUserId: campaign.userId,
+          type: "credit",
+          amount: creditAmount,
+          description: "Refund: Campaign Rejected by Admin"
+        }],
+        { session }
+      );
+    }
+
+    // 6️⃣ Update campaign status
     campaign.status = status;
-    await campaign.save({ session }); // CRITICAL: Link to session
+    await campaign.save({ session });
 
     await session.commitTransaction();
+
     res.json(campaign);
 
   } catch (err) {
-    await session.abortTransaction();
+
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+    }
+
     console.error("Update Status Error:", err.message);
-    res.status(400).json({ message: err.message || "Server error" });
+    res.status(400).json({ message: err.message || "Status update failed" });
+
   } finally {
     session.endSession();
+  }
+};
+
+exports.postStatusReport = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const { id } = req.params;
+
+    if (!req.file) {
+      throw new Error("Report file is required");
+    }
+
+    const campaign = await Campaign.findById(id).session(session);
+    if (!campaign) {
+      throw new Error("Campaign not found");
+    }
+
+    if (campaign.status !== "processing") {
+      throw new Error("Only processing campaigns can be completed");
+    }
+
+    const file = req.file;
+    const fileExtension = file.originalname.split(".").pop();
+    const fileName = `reports/${uuidv4()}.${fileExtension}`;
+
+    const uploadParams = {
+      Bucket: process.env.WASABI_BUCKET,
+      Key: fileName,
+      Body: file.buffer,
+      ContentType: file.mimetype,
+    };
+
+    await s3.send(new PutObjectCommand(uploadParams));
+
+    const fileUrl = `https://s3.${process.env.WASABI_REGION}.wasabisys.com/${fileName}`;
+
+    // ✅ Save report in campaign
+    campaign.report = {
+      fileUrl,
+      fileKey: fileName,
+      uploadedAt: new Date(),
+      uploadedBy: req.user._id
+    };
+
+    campaign.status = "completed";
+
+    await campaign.save({ session });
+
+    await session.commitTransaction();
+
+    res.json({
+      message: "Campaign completed and report uploaded successfully",
+      campaign
+    });
+
+  } catch (error) {
+
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+    }
+
+    console.error("Report Upload Error:", error.message);
+    res.status(400).json({ message: error.message });
+
+  } finally {
+    session.endSession();
+  }
+};
+
+exports.getStatusReport = async (req, res) => {
+  try {
+    const fileKey = req.params[0] || req.params.fileKey;
+
+    const command = new GetObjectCommand({
+      Bucket: process.env.WASABI_BUCKET,
+      Key: fileKey,
+    });
+
+    // 1. Get the data FROM Wasabi
+    const s3Response = await s3.send(command);
+
+    // 2. Prepare YOUR server's response headers
+    res.setHeader("Content-Type", s3Response.ContentType || "application/pdf");
+    res.setHeader("Content-Disposition", "inline");
+
+    // 3. POUR the data from s3Response INTO res
+    // You do NOT need res.send() here. pipe() handles the "sending".
+    s3Response.Body.pipe(res);
+
+  } catch (error) {
+    console.error("Wasabi Fetch Error:", error.message);
+    res.status(404).json({ message: "File not found" });
   }
 };
 
@@ -260,53 +467,90 @@ if (search) {
 
 exports.getAllUserCampaigns = async (req, res) => {
   try {
-          // retrieving all filters from query
-          const page = parseInt(req.query.page) || 1;
-          const limit = parseInt(req.query.limit) || 5;
-          
-          const search = req.query.search || "";
-          const status = req.query.status || "";
-          const sort = req.query.sort || "createdAt_desc";
-      
-          // applying pagination logic
-          const skip = (page - 1) * limit;
-      
-          let filter = {};
-      
-          if (search) {
-            filter.title = { $regex: search, $options: "i" };
-          }
-      
-          if (status) {
-            filter.status = status;
-          }
-      
-          let sortOptions = {};
-          if (sort === "createdAt_desc") sortOptions = { createdAt: -1 };
-          if (sort === "createdAt_asc" ) sortOptions = { createdAt:  1 };
-      
-          // paginated + populated + optimized query
-          const campaigns = await Campaign.find(filter)
-            .populate("userId", "name email credits")
-            .sort(sortOptions)
-            .skip(skip)
-            .limit(limit)
-            .lean();
-      
-          // total count for pagination
-          const totalCampaigns = await Campaign.countDocuments(filter);
-      
-          res.json({
-            campaigns,
-            totalCampaigns,
-            totalPages: Math.ceil(totalCampaigns / limit),
-            currentPage: page,
-          });
-      
-        } catch (err) {
-          console.error(err);
-          res.status(500).json({ message: "Server error" });
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 5;
+    const search = req.query.search || "";
+    const status = req.query.status || "";
+    const sort = req.query.sort || "createdAt_desc";
+    const skip = (page - 1) * limit;
+
+    let sortOptions = { createdAt: -1 };
+    if (sort === "createdAt_asc") sortOptions = { createdAt: 1 };
+
+    // 1. Build the initial filter (for fields directly on the Campaign)
+    let matchStage = {};
+    if (status) matchStage.status = status;
+
+    const pipeline = [
+      { $match: matchStage },
+      {
+        $lookup: {
+          from: "users", // The name of your users collection
+          localField: "userId",
+          foreignField: "_id",
+          as: "userDetails"
         }
+      },
+      { $unwind: "$userDetails" }
+    ];
+
+    // 2. Add SEARCH stage (Searches Title OR User Email OR User Name)
+    if (search) {
+      const safeSearch = _.escapeRegExp(search);
+      pipeline.push({
+        $match: {
+          $or: [
+            { "title": { $regex: safeSearch, $options: "i" } },
+            { "userDetails.email": { $regex: safeSearch, $options: "i" } },
+            { "userDetails.name": { $regex: safeSearch, $options: "i" } }
+          ]
+        }
+      });
+    }
+
+    // 3. Use Facet for Count and Data
+    const result = await Campaign.aggregate([
+      ...pipeline,
+      {
+        $facet: {
+          metadata: [{ $count: "total" }],
+          data: [
+            { $sort: sortOptions },
+            { $skip: skip },
+            { $limit: limit },
+            {
+              $project: {
+                title: 1,
+                status: 1,
+                createdAt: 1,
+                phoneNumbers: 1,
+                userId: {
+                  _id: "$userDetails._id",
+                  name: "$userDetails.name",
+                  email: "$userDetails.email",
+                  credits: "$userDetails.credits"
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]);
+
+    const totalCampaigns = result[0]?.metadata[0]?.total || 0;
+    const campaigns = result[0]?.data || [];
+
+    res.json({
+      campaigns,
+      totalCampaigns,
+      totalPages: Math.ceil(totalCampaigns / limit),
+      currentPage: page,
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
+  }
 };
           
 exports.getCampaignDetails =  async (req, res) => {

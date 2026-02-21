@@ -4,7 +4,12 @@ const mongoose = require("mongoose");
 const mediaSchema = new mongoose.Schema({
   url: { type: String, required: true },
   publicId: { type: String, required: true },
-  type: { type: String, required: true }
+  type: { type: String, required: true },
+  provider: { 
+    type: String, 
+    required: true, 
+    enum: ["cloudinary", "wasabi"] // optional enum for safety
+  },
 });
 
 const campaignSchema = new mongoose.Schema({

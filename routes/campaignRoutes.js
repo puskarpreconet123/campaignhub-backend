@@ -7,10 +7,7 @@ const campaignController = require("../controllers/campaignController");
 router.post(
   "/create",
   auth,
-  upload.fields([
-    { name: "images", maxCount: 10 },
-    { name: "pdfVideo", maxCount: 5 }
-  ]),
+  upload,
   campaignController.createCampaign
 );
 

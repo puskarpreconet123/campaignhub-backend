@@ -2,6 +2,7 @@ const Campaign = require("../models/Campaign");
 const User = require("../models/User")
 const Transaction = require("../models/Transaction");
 const { default: mongoose } = require("mongoose");
+const _ = require('lodash'); // Ensure lodash is imported
 
 exports.getDashboard = async (req, res) => {
   res.json({ msg: "User dashboard data" });
@@ -113,8 +114,6 @@ exports.getUserDetails = async (req, res) => {
     res.status(500).json({ message: "Server error while fetching profile" });
   }
 }
-
-const _ = require('lodash'); // Ensure lodash is imported
 
 exports.getUserCreditHistory = async (req, res) => {
   try {
